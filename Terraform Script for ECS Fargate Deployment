@@ -1,73 +1,167 @@
 provider "aws" {
-  region = "ap-south-1"
+  region = "<your-aws-region>"
 }
 
-# Define VPC
-resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "3.10.0"
+
+  name = "my-vpc"
+  cidr = "10.0.0.0/16"
+
+  azs             = ["us-west-1a", "us-west-1b"]
+  public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
+
+  enable_nat_gateway = false
 }
 
-resource "aws_subnet" "public" {
-  count = 2
-  vpc_id     = aws_vpc.main.id
-  cidr_block = element(["10.0.1.0/24", "10.0.2.0/24"], count.index)
-  map_public_ip_on_launch = true
-}
-
-resource "aws_internet_gateway" "gw" {
-  vpc_id = aws_vpc.main.id
-}
-
-# ECS Cluster
 resource "aws_ecs_cluster" "main" {
-  name = "ecs-cluster"
+  name = "my-cluster"
 }
 
-# Application Load Balancer
-resource "aws_lb" "app" {
-  name               = "app-lb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.lb_sg.id]
-  subnets            = aws_subnet.public[*].id
+resource "aws_ecr_repository" "main" {
+  name = "my-repo"
 }
 
-# ECS Task Definition and Service
-resource "aws_ecs_task_definition" "app" {
-  family                   = "app"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"
-  memory                   = "512"
-
-  container_definitions = jsonencode([
-    {
-      name      = "app"
-      image     = "${aws_ecr_repository.app.repository_url}:latest"
-      essential = true
-      portMappings = [
-        {
-          containerPort = 3000
-          hostPort      = 3000
+resource "aws_iam_role" "ecs_task_execution_role" {
+  name = "ecsTaskExecutionRole"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
         }
-      ]
-    }
-  ])
+      },
+    ]
+  })
+
+  managed_policy_arns = [
+    "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
+  ]
 }
 
-resource "aws_ecs_service" "app" {
-  name            = "app"
+resource "aws_ecs_task_definition" "app" {
+  family                   = "my-task"
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  container_definitions    = <<DEFINITION
+[
+  {
+    "name": "my-container",
+    "image": "${aws_ecr_repository.main.repository_url}:latest",
+    "essential": true,
+    "memory": 512,
+    "cpu": 256,
+    "portMappings": [
+      {
+        "containerPort": 3000,
+        "hostPort": 3000
+      }
+    ]
+  }
+]
+DEFINITION
+}
+
+resource "aws_ecs_service" "main" {
+  name            = "my-service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
   desired_count   = 1
   launch_type     = "FARGATE"
+
   network_configuration {
-    subnets         = aws_subnet.public[*].id
-    security_groups = [aws_security_group.app_sg.id]
+    subnets         = module.vpc.public_subnets
+    assign_public_ip = true
+    security_groups = [aws_security_group.lb_sg.id]
   }
+
   load_balancer {
-    target_group_arn = aws_lb_target_group.app.arn
-    container_name   = "app"
+    target_group_arn = aws_lb_target_group.main.arn
+    container_name   = "my-container"
     container_port   = 3000
+  }
+
+  depends_on = [aws_lb_listener.main]
+}
+
+resource "aws_lb" "main" {
+  name               = "my-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.lb_sg.id]
+  subnets            = module.vpc.public_subnets
+}
+
+resource "aws_lb_target_group" "main" {
+  name     = "my-tg"
+  port     = 3000
+  protocol = "HTTP"
+  vpc_id   = module.vpc.vpc_id
+
+  health_check {
+    path                = "/health"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+resource "aws_lb_listener" "main" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.main.arn
+  }
+}
+
+resource "aws_security_group" "lb_sg" {
+  name        = "lb-sg"
+  description = "Allow HTTP traffic"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "scale_up"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  scaling_group_name     = aws_ecs_service.main.name
+  metric_aggregation_type = "Average"
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_alarm" {
+  alarm_name          = "cpu_alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/ECS"
+  period              = "60"
+  statistic           = "Average"
+  threshold           = "70"
+
+  alarm_actions       = [aws_autoscaling_policy.scale_up.arn]
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
   }
 }
